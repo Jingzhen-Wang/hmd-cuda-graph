@@ -1,0 +1,6 @@
+hmd_cpu
+hmd_gpu
+hmd_graph
+*.o
+*.out
+.DS_Store
