@@ -1,7 +1,7 @@
 CC      ?= mpicc
 NVCC    ?= nvcc
 CFLAGS  = -O -Iinclude -fopenmp
-NVFLAGS = -O -Iinclude -ccbin mpicxx -Xcompiler -fopenmp
+NVFLAGS = -O3 -Iinclude -ccbin mpicxx -Xcompiler -fopenmp
 
 .PHONY: all gpu graph clean
 

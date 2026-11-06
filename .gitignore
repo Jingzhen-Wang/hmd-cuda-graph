@@ -3,4 +3,5 @@ hmd_gpu
 hmd_graph
 *.o
 *.out
+!benchmarks/*.out
 .DS_Store

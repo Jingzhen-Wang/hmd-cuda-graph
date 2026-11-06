@@ -43,9 +43,11 @@ MPI (inter-node, domain decomposition)        -- unchanged from hmd.c
 
 - [x] **Phase 0** — repo skeleton, CPU baseline (`hmd_cpu.c`, copied from
       Assignment 5) builds and runs as a correctness reference.
-- [ ] **Phase 1** — single-GPU, single-MPI-rank CUDA port of
-      `compute_accel()` (`src/hmd_gpu.cu`). Validate total energy matches the
-      CPU reference to ~5-6 digits, as in Assignment 5.
+- [x] **Phase 1** — single-GPU, single-MPI-rank CUDA port of
+      `compute_accel()` (`src/hmd_gpu.cu`). Validated on CARC (`gpu` partition,
+      job 13733768): total energy matches the CPU reference exactly to every
+      printed digit across all 10 timesteps, and the GPU kernel runs ~9.5x
+      faster on compute time (0.68s vs 6.51s for `CPU & COMT`).
 - [ ] **Phase 2** — wrap into the full MPI + OpenMP(1 thread/GPU) + CUDA
       structure, matching `pi3.cu`'s multi-GPU pattern.
 - [ ] **Phase 3** — capture the per-step kernel sequence as a CUDA Graph
@@ -75,4 +77,4 @@ pmd.in                 MD run parameters (from Assignment 5)
 
 ## Status
 
-Phase 0 in progress.
+Phase 1 validated. Starting Phase 2 (multi-GPU MPI + OpenMP + CUDA).
