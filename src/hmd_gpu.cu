@@ -1,48 +1,71 @@
 /*----------------------------------------------------------------------
-Program hmd_gpu.cu -- Phase 1 of the hmd-cuda-graph final project: a
-single-GPU CUDA port of compute_accel(), starting from hmd_cpu.c
-(= Assignment 5's hmd.c).  No OpenMP / multi-GPU yet (that is Phase 2) and
-no CUDA Graph yet (Phase 3) -- this phase's only goal is to prove the GPU
-force kernel is numerically correct against the CPU reference.
+Program hmd_gpu.cu -- Phase 2 of the hmd-cuda-graph final project: full
+MPI + OpenMP (one thread per GPU) + CUDA, extending Phase 1's validated
+single-GPU CUDA port of compute_accel().  No CUDA Graph yet (Phase 3)
+-- this phase's goal is to reproduce hmd_cpu.c's OpenMP cell-block
+decomposition, but have each thread drive its own GPU instead of its own
+CPU core, following the MPI-rank -> OpenMP-thread -> CUDA nesting of
+Assignment 6's pi3.cu.
 
-Everything except compute_accel() is copied unchanged from hmd_cpu.c, so
-that init_params()/set_topology()/init_conf() produce the IDENTICAL cell
-geometry (al, lc, rc) as the validated Assignment 5 run, letting the two
-be compared head-to-head on the same pmd.in / vproc / vthrd config.
+Everything except compute_accel() (and main()'s thread/device setup) is
+copied unchanged from hmd_cpu.c, so that init_params()/set_topology()/
+init_conf() produce the IDENTICAL cell geometry (al, lc, rc, thbk) as the
+validated Assignment 5 & Phase 1 runs.
 
-Modifications relative to hmd_cpu.c, all marked "***** MODIFIED (GPU) *****":
+Modifications relative to Phase 1, all marked "***** MODIFIED (GPU) *****":
 
-1. main(): the omp_set_num_threads(nthrd) call is dropped -- compute_accel()
-   no longer uses OpenMP at all in this phase.
-2. compute_accel(): the linked-cell-list build stays on the host (cheap,
-   O(N)); the pair-force double loop is replaced by one CUDA thread block
-   per interior cell (grid = (lc[0],lc[1],lc[2])), each block doing
-   exactly the work hmd_cpu.c's single central cell, mc[], did. The same
-   race-avoidance trick already validated on the CPU in Assignment 5
-   carries over unchanged: every central-cell atom i unconditionally
-   accumulates its own force from every neighbor j within cutoff (no
-   Newton's-third-law write to ra[j]), which is race-free here for the
-   same reason it was race-free across OpenMP threads -- each atom's home
-   cell, and therefore its ra[] entry, is owned by exactly one block.
-   Potential energy is accumulated per-cell (pe_cell[c], the GPU analogue
-   of hmd_cpu.c's per-thread lpe_td[]) and reduced on the host after the
-   kernel returns.
-   Per-step host<->device copies are intentionally naive here (Phase 3
-   will keep r[]/ra[] resident on the device and replace the launch with
-   a replayed CUDA Graph instead).
+1. main(): omp_set_num_threads(nthrd) is restored (as in hmd_cpu.c), and
+   the number of visible GPUs on the node is queried once via
+   cudaGetDeviceCount() into num_device. nthrd (from vthrd[], unchanged
+   from Assignment 5's CPU cell-block geometry) and num_device (the
+   node's actual GPU count) are independent: threads share a GPU via
+   round-robin (cudaSetDevice(std % num_device)) exactly as pi3.cu's
+   mpid%NUM_DEVICE, generalized from a compile-time constant to a
+   runtime-queried device count.
+2. compute_accel(): the outer #pragma omp parallel is restored (as in
+   hmd_cpu.c) around Phase 1's single-GPU kernel launch. Each thread
+   computes its own cell-block offset, mofst[], exactly as hmd_cpu.c did,
+   selects its GPU, and launches gpu_compute_accel_kernel() with a grid
+   sized to just its own thbk[0]*thbk[1]*thbk[2] cells (not the whole
+   domain) -- the kernel itself is unchanged except for an added mofst
+   offset added to the block index. Each thread owns a SEPARATE set of
+   device buffers (indexed by thread id) since each may run on a
+   different physical GPU; r[]/head[]/lscl[] (needed in full, since a
+   thread's neighbor cells can be owned by another thread) are copied to
+   every thread's device, same as hmd_cpu.c's threads all reading the
+   shared head[]/lscl[] arrays. Unlike hmd_cpu.c -- where index-disjoint
+   ownership lets every thread write directly into a SHARED ra[] inside
+   the parallel region -- each thread's force/energy results here land in
+   its OWN host buffer (ra_host_td[std]/pe_host_td[std]) and are merged
+   into the global ra[]/lpe_td[] in a short SEQUENTIAL pass after the
+   parallel region closes. (A parallel merge would still be correct in
+   value -- untouched entries are zero -- but it is a data race by the
+   C/OpenMP memory model: every thread's merge loop would touch every
+   index, including ones owned by other threads, even if only adding
+   zero there.)
 ----------------------------------------------------------------------*/
 #include "hmd.h"
 
+#define MAX_THREADS 64  /* ***** MODIFIED (GPU) ***** cap for per-thread
+                            device-buffer arrays; nthrd (default 4, from
+                            vthrd[]) is always far below this. */
+
+static int num_device = 1;  /* ***** MODIFIED (GPU) ***** # of GPUs
+                                visible on this node; set once in main() */
+
 /* ***** MODIFIED (GPU) ***** pair-force kernel: one thread block per
-   interior linked-list cell (blockIdx.{x,y,z}+1 = mc[0..2]). */
+   interior linked-list cell owned by the calling OpenMP thread
+   (blockIdx.{x,y,z}+1+mofst{0,1,2} = mc[0..2]), unchanged from Phase 1
+   otherwise. */
 __global__ void gpu_compute_accel_kernel(
     const double *r, double *ra, const int *head, const int *lscl,
     double *pe_cell, int lcyz2, int lc2d2, int n,
-    double rrCut, double Duc, double Uc)
+    double rrCut, double Duc, double Uc,
+    int mofst0, int mofst1, int mofst2)
 {
-  int mc0 = blockIdx.x + 1;
-  int mc1 = blockIdx.y + 1;
-  int mc2 = blockIdx.z + 1;
+  int mc0 = blockIdx.x + 1 + mofst0;
+  int mc1 = blockIdx.y + 1 + mofst1;
+  int mc2 = blockIdx.z + 1 + mofst2;
   int c = mc0*lcyz2 + mc1*lc2d2 + mc2;
 
   double lpe = 0.0;
@@ -99,7 +122,12 @@ int main(int argc, char **argv) {
   vid[1] = (sid/vproc[2])%vproc[1];
   vid[2] = sid%vproc[2];
 
-  /* ***** MODIFIED (GPU) ***** no OpenMP in this phase */
+  /* ***** MODIFIED (GPU) ***** restore OpenMP (one thread per GPU, as in
+     hmd_cpu.c), and find out how many GPUs this node actually has */
+  omp_set_num_threads(nthrd);
+  cudaGetDeviceCount(&num_device);
+  if (num_device < 1) num_device = 1;
+  if (sid == 0) printf("nthrd = %d, num_device = %d\n", nthrd, num_device);
 
   init_params();
   set_topology();
@@ -374,20 +402,29 @@ the residents.
 ***** MODIFIED (GPU) *****
 The linked-cell-list build (head[]/lscl[]) stays on the host, unchanged
 from hmd_cpu.c.  The pair-force double loop over central cells is
-replaced by gpu_compute_accel_kernel(), launched with one thread block
-per interior cell; see the kernel's own comment and the file header for
-the race-avoidance argument.  Per-cell potential energy (pe_cell[]) is
-reduced on the host after the kernel returns, replacing hmd_cpu.c's
-reduction over lpe_td[nthrd].
+replaced, per OpenMP thread, by gpu_compute_accel_kernel() launched on
+that thread's GPU with one thread block per cell in its own thbk-sized
+block (exactly the cells hmd_cpu.c's thread std would have scanned).
+Each thread's results land in its own host buffer and are merged into
+the shared ra[]/lpe_td[] sequentially after the parallel region closes;
+see the file header for why that merge is NOT done inside the parallel
+region.
 ----------------------------------------------------------------------*/
-  int i,a,lc2[3],lcyz2,lcxyz2,mc[3],c;
+  int i,a,lc2[3],lcyz2,lcxyz2,mc[3],c,std;
   double lpe;
-  static double *dev_r=NULL, *dev_ra=NULL, *dev_pe=NULL;
-  static int *dev_head=NULL, *dev_lscl=NULL;
-  static double *pe_host=NULL;
+  double lpe_td[MAX_THREADS];
 
-  /* Reset the forces (host) */
+  static double *dev_r[MAX_THREADS]    = {NULL};
+  static double *dev_ra[MAX_THREADS]   = {NULL};
+  static double *dev_pe[MAX_THREADS]   = {NULL};
+  static int    *dev_head[MAX_THREADS] = {NULL};
+  static int    *dev_lscl[MAX_THREADS] = {NULL};
+  static double *ra_host_td[MAX_THREADS] = {NULL};
+  static double *pe_host_td[MAX_THREADS] = {NULL};
+
+  /* Reset the forces (host) & per-thread energy accumulators */
   for (i=0; i<n; i++) for (a=0; a<3; a++) ra[i][a] = 0.0;
+  for (std=0; std<nthrd; std++) lpe_td[std] = 0.0;
 
   /* Make a linked-cell list, lscl (host, unchanged from hmd_cpu.c)----*/
 
@@ -404,34 +441,64 @@ reduction over lpe_td[nthrd].
     head[c] = i;
   }
 
-  /* ***** MODIFIED (GPU) ***** begin: device buffers (allocated once,
-     reused every call -- Phase 3 will keep r[]/ra[] resident instead of
-     re-copying every step) */
-  if (!dev_r) {
-    cudaMalloc((void**)&dev_r,    sizeof(double)*NEMAX*3);
-    cudaMalloc((void**)&dev_ra,   sizeof(double)*NMAX*3);
-    cudaMalloc((void**)&dev_head, sizeof(int)*NCLMAX);
-    cudaMalloc((void**)&dev_lscl, sizeof(int)*NEMAX);
-    cudaMalloc((void**)&dev_pe,   sizeof(double)*NCLMAX);
-    pe_host = (double*)malloc(sizeof(double)*NCLMAX);
+  /* ***** MODIFIED (GPU) ***** begin: one OpenMP thread per GPU, each
+     driving its own cell block on its own device -- mirrors hmd_cpu.c's
+     parallel region (std/vtd[]/mofst[] computed the same way) nested
+     with pi3.cu's cudaSetDevice(mpid % NUM_DEVICE) pattern. */
+  #pragma omp parallel private(std)
+  {
+    int vtd[3], mofst[3], a2;
+
+    std = omp_get_thread_num();
+    vtd[0] = std/(vthrd[1]*vthrd[2]);
+    vtd[1] = (std/vthrd[2])%vthrd[1];
+    vtd[2] = std%vthrd[2];
+    for (a2=0; a2<3; a2++) mofst[a2] = vtd[a2]*thbk[a2];
+
+    cudaSetDevice(std % num_device);
+
+    if (!dev_r[std]) {
+      cudaMalloc((void**)&dev_r[std],    sizeof(double)*NEMAX*3);
+      cudaMalloc((void**)&dev_ra[std],   sizeof(double)*NMAX*3);
+      cudaMalloc((void**)&dev_head[std], sizeof(int)*NCLMAX);
+      cudaMalloc((void**)&dev_lscl[std], sizeof(int)*NEMAX);
+      cudaMalloc((void**)&dev_pe[std],   sizeof(double)*NCLMAX);
+      ra_host_td[std] = (double*)malloc(sizeof(double)*NMAX*3);
+      pe_host_td[std] = (double*)malloc(sizeof(double)*NCLMAX);
+    }
+
+    /* Full r[]/head[]/lscl[] copied to every thread's device: a thread's
+       neighbor cells can be owned by any other thread, exactly as in
+       hmd_cpu.c where every thread reads the same shared arrays. */
+    cudaMemcpy(dev_r[std],    r,    sizeof(double)*(n+nb)*3, cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_head[std], head, sizeof(int)*lcxyz2,       cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_lscl[std], lscl, sizeof(int)*(n+nb),        cudaMemcpyHostToDevice);
+    cudaMemset(dev_ra[std], 0, sizeof(double)*n*3);
+    cudaMemset(dev_pe[std], 0, sizeof(double)*lcxyz2);
+
+    /* Grid sized to just this thread's own thbk[]-sized cell block,
+       offset by mofst[] inside the kernel. */
+    dim3 grid(thbk[0], thbk[1], thbk[2]);
+    gpu_compute_accel_kernel<<<grid,1>>>(
+        dev_r[std], dev_ra[std], dev_head[std], dev_lscl[std], dev_pe[std],
+        lcyz2, lc2[2], n, RCUT*RCUT, Duc, Uc,
+        mofst[0], mofst[1], mofst[2]);
+
+    cudaMemcpy(ra_host_td[std], dev_ra[std], sizeof(double)*n*3,    cudaMemcpyDeviceToHost);
+    cudaMemcpy(pe_host_td[std], dev_pe[std], sizeof(double)*lcxyz2, cudaMemcpyDeviceToHost);
+  } /* End omp parallel */
+
+  /* Sequential merge (see file header for why this isn't done above):
+     each thread's host buffer is zero everywhere except the atoms/cells
+     it owns, so a straight add reproduces hmd_cpu.c's shared-array
+     result exactly, with no cross-thread races. */
+  for (std=0; std<nthrd; std++) {
+    for (i=0; i<n; i++) for (a=0; a<3; a++) ra[i][a] += ra_host_td[std][3*i+a];
+    for (c=0; c<lcxyz2; c++) lpe_td[std] += pe_host_td[std][c];
   }
 
-  cudaMemcpy(dev_r,    r,    sizeof(double)*(n+nb)*3, cudaMemcpyHostToDevice);
-  cudaMemcpy(dev_head, head, sizeof(int)*lcxyz2,       cudaMemcpyHostToDevice);
-  cudaMemcpy(dev_lscl, lscl, sizeof(int)*(n+nb),        cudaMemcpyHostToDevice);
-  cudaMemset(dev_ra, 0, sizeof(double)*n*3);
-  cudaMemset(dev_pe, 0, sizeof(double)*lcxyz2); /* zero padding cells too */
-
-  dim3 grid(lc[0], lc[1], lc[2]);
-  gpu_compute_accel_kernel<<<grid,1>>>(
-      dev_r, dev_ra, dev_head, dev_lscl, dev_pe,
-      lcyz2, lc2[2], n, RCUT*RCUT, Duc, Uc);
-
-  cudaMemcpy(ra, dev_ra, sizeof(double)*n*3, cudaMemcpyDeviceToHost);
-  cudaMemcpy(pe_host, dev_pe, sizeof(double)*lcxyz2, cudaMemcpyDeviceToHost);
-
   lpe = 0.0;
-  for (c=0; c<lcxyz2; c++) lpe += pe_host[c];
+  for (std=0; std<nthrd; std++) lpe += lpe_td[std];
   /* ***** MODIFIED (GPU) ***** end */
 
   /* Global potential energy */
