@@ -49,7 +49,13 @@ MPI (inter-node, domain decomposition)        -- unchanged from hmd.c
       printed digit across all 10 timesteps, and the GPU kernel runs ~9.5x
       faster on compute time (0.68s vs 6.51s for `CPU & COMT`).
 - [ ] **Phase 2** — wrap into the full MPI + OpenMP(1 thread/GPU) + CUDA
-      structure, matching `pi3.cu`'s multi-GPU pattern.
+      structure, matching `pi3.cu`'s multi-GPU pattern. Implemented and
+      compiles cleanly on CARC. First validation attempt (job 13770832)
+      failed with `MPI_ERR_RANK` on *both* `hmd_cpu` and `hmd_gpu` —
+      root-caused to a test-script bug, not the Phase 2 code: the binary is
+      compiled with `vproc=(1,1,2)` (nproc=2) by default, but the job
+      launched only `mpirun -n 1`. Fixed the Slurm script to `-n 2` and
+      resubmitted (job 14487375); result pending.
 - [ ] **Phase 3** — capture the per-step kernel sequence as a CUDA Graph
       (`cudaGraphExec`), replayed instead of re-launched each step; update
       graph node parameters between steps instead of re-capturing.
