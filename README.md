@@ -30,6 +30,8 @@ MPI (inter-node, domain decomposition)        -- unchanged from hmd.c
      └─ CUDA (per-thread cell-block force kernel, on its own cudaSetDevice)
 ```
 
+![Architecture: MPI rank containing 4 OpenMP threads round-robinning over 2 GPUs, each driving the shared gpu_compute_accel_kernel, captured as a CUDA Graph in Phase 3](benchmarks/architecture.png)
+
 - **MPI layer**: unchanged from `hmd.c` — `atom_copy()` / `atom_move()` still
   run on the host, exchanging boundary atoms between ranks.
 - **OpenMP layer**: each MPI rank spawns `NUM_DEVICE` threads; each thread
@@ -71,11 +73,27 @@ MPI (inter-node, domain decomposition)        -- unchanged from hmd.c
 - [ ] **Benchmark** — launch-overhead-bound (small N) vs compute-bound
       (large N) comparison, naive-GPU vs Graph-optimized, plotted.
 
+## Results so far
+
+All three binaries agree exactly on total energy (every printed digit, all 10
+timesteps) on the same validation job (14490082, `nglob=55,296`, `nproc=2`,
+`nthrd=4`, `num_device=2`):
+
+![Bar chart: compute_accel() force-kernel timing for CPU (6.82s), naive GPU / Phase 2 (2.20s), and GPU + CUDA Graph / Phase 3 (2.66s), same job and node](benchmarks/timing_comparison.png)
+
+The GPU is ~3x faster than the CPU either way; CUDA Graph replay is not yet a
+further win *at this system size and step count* — the one-time capture cost
+isn't amortized over only 10 replays, and kernel compute time already
+dominates launch overhead here. That's exactly the open question the
+benchmark phase will answer: sweep toward small-N/many-step runs, where
+launch overhead (not compute) should dominate and Graphs should pull ahead.
+
 ## Build
 
 ```
 make            # builds the CPU reference binary, hmd_cpu
 make gpu        # (Phase 1+) builds the CUDA binary, hmd_gpu
+make graph      # (Phase 3) builds the CUDA-Graph binary, hmd_graph
 ```
 
 ## Layout
@@ -92,4 +110,5 @@ pmd.in                 MD run parameters (from Assignment 5)
 
 ## Status
 
-Phase 1 validated. Starting Phase 2 (multi-GPU MPI + OpenMP + CUDA).
+Phases 0–3 implemented and validated (exact energy match, CPU vs. naive GPU
+vs. GPU+CUDA Graph). Only the benchmark sweep remains.
