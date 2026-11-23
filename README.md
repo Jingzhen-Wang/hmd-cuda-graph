@@ -59,6 +59,10 @@ MPI (inter-node, domain decomposition)        -- unchanged from hmd.c
 - [ ] **Phase 3** — capture the per-step kernel sequence as a CUDA Graph
       (`cudaGraphExec`), replayed instead of re-launched each step; update
       graph node parameters between steps instead of re-capturing.
+      Implemented (`src/hmd_graph.cu`), compiles cleanly on CARC with CUDA
+      12.6. Validation job (14490082, runs `hmd_cpu`/`hmd_gpu`/`hmd_graph`
+      side by side with `-n 2`) submitted; result pending, together with
+      Phase 2's (job 14487375).
 - [ ] **Benchmark** — launch-overhead-bound (small N) vs compute-bound
       (large N) comparison, naive-GPU vs Graph-optimized, plotted.
 
