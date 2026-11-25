@@ -18,25 +18,31 @@ it computes, so Phase 2's validated numerics carry over unchanged.
 
 Modifications relative to Phase 2, all marked "***** MODIFIED (GRAPH) *****":
 
-1. Per-thread device buffers are now sized to their COMPILE-TIME MAXIMA
-   (NEMAX/NMAX/NCLMAX) and copied/zeroed at that fixed size on EVERY
-   call, never at the current, run-time-varying n/nb/lcxyz2. This is
-   required for graph replay to be safe: n and nb (resident/boundary
-   atom counts) change slightly over the run as atoms cross MPI-rank
-   boundaries in atom_move()/atom_copy(), but a captured graph node's
-   byte count is frozen at capture time -- replaying a node captured for
-   a smaller n against a later, larger n would silently copy too little
-   data. Copying the full fixed extent instead means every graph node's
-   size is a compile-time constant, so the SAME graph is correct and
-   reusable for the rest of the run no matter how n/nb drift. (This is
-   safe, not just convenient: head[]/lscl[]'s linked lists only ever
-   point to indices below the current n+nb, so the kernel never reads
-   the extra, possibly-stale slots copied above that range. lcxyz2 only
-   depends on al[]/RCUT, which this fixed-volume NVE run never changes,
-   so it is already constant across the whole run.)
-2. Each thread creates its own cudaStream_t once (so later kernel
+1. Per-thread device buffers are sized to the current need (n+nb for
+   r[]/lscl[], n for ra[]) plus 25% headroom, NOT the run-time n/nb
+   directly and NOT the compile-time maxima (NEMAX/NMAX) either. A
+   captured graph node's byte count is frozen at capture time, so a node
+   captured for a smaller n+nb would silently copy too little data once
+   n+nb grows (n/nb drift slightly over the run as atoms cross MPI-rank
+   boundaries) -- headroom absorbs that ordinary drift without forcing a
+   recapture every step. Always sizing to the compile-time maxima
+   instead (NEMAX=200000 etc.) would also be safe, but silently taxes
+   every single step with however many times larger than the actual
+   system NEMAX/NMAX are -- for a modest system that can be a multi-MB
+   copy inflation per step per thread, big enough to swamp the very
+   launch-overhead savings this phase exists to demonstrate. head[]/
+   pe_cell[] are the one exception: lcxyz2 only depends on al[]/RCUT,
+   which this fixed-volume NVE run never changes, so it is captured at
+   its exact (constant) size with no headroom needed, and those two
+   buffers are allocated exactly once, ever.
+2. If growth ever does exceed the captured headroom (point 1), the
+   stale graph, stream, and NEMAX/NMAX-scaled buffers are torn down and
+   a new, larger capture replaces them -- see the `cap_ne[]`/`cap_nm[]`/
+   `cap_cl[]` high-water marks in compute_accel(). Expected to be rare to
+   never for a stable NVE run like this one's.
+3. Each thread creates its own cudaStream_t once (so later kernel
    launches/copies are issued on that stream rather than the default
-   stream) and, on its first call, records the fixed operation sequence
+   stream) and, whenever (re)capturing, records the operation sequence
    with cudaStreamBeginCapture(..., cudaStreamCaptureModeThreadLocal) /
    cudaStreamEndCapture(), then cudaGraphInstantiate()s it into a
    cudaGraphExec_t kept in a static per-thread array (paralleling
@@ -44,15 +50,16 @@ Modifications relative to Phase 2, all marked "***** MODIFIED (GRAPH) *****":
    NUM_DEVICE threads to each be mid-capture on their own stream/device
    at the same time without one thread's unrelated CUDA calls being
    mistaken for another's capture.
-3. compute_accel() itself now just does cudaGraphLaunch(graphExec[std],
+4. compute_accel() itself now just does cudaGraphLaunch(graphExec[std],
    stream[std]) followed by cudaStreamSynchronize(stream[std]) on every
-   call after the first -- no cudaMemcpy/cudaMemset/kernel-launch calls
-   appear in the per-step path at all. Because every captured node reads
+   call -- no cudaMemcpy/cudaMemset/kernel-launch calls appear in the
+   steady-state per-step path at all. Because every captured node reads
    from / writes to the SAME fixed host and device addresses every call
    (the host-side r[]/head[]/lscl[] arrays are not reallocated -- single_step()
    / atom_move() / atom_copy() update them in place), replaying the graph
    automatically picks up each step's fresh data; no node-parameter update
-   (cudaGraphExecKernelNodeSetParams) or recapture is ever needed.
+   (cudaGraphExecKernelNodeSetParams) is ever needed, only the occasional
+   recapture of point 2.
 ----------------------------------------------------------------------*/
 #include "hmd.h"
 
@@ -446,6 +453,15 @@ parallel region closes, exactly as in Phase 2.
   static int     n_td[MAX_THREADS];               /* host staging value for dev_n[std] */
   static cudaStream_t    stream[MAX_THREADS];
   static cudaGraphExec_t graphExec[MAX_THREADS];
+  static int     cap_ne[MAX_THREADS] = {0}; /* ***** MODIFIED (GRAPH) *****
+                                                captured size (high-water mark,
+                                                with headroom) for NEMAX-scaled
+                                                buffers (r[]/lscl[]) -- see
+                                                file header points 1-2. */
+  static int     cap_nm[MAX_THREADS] = {0}; /* same, for NMAX-scaled ra[] */
+  static int     cap_cl[MAX_THREADS] = {0}; /* captured lcxyz2 (constant for
+                                                the whole run; tracked per-
+                                                thread only for symmetry) */
 
   /* Reset the forces (host) & per-thread energy accumulators */
   for (i=0; i<n; i++) for (a=0; a<3; a++) ra[i][a] = 0.0;
@@ -488,41 +504,75 @@ parallel region closes, exactly as in Phase 2.
        whatever is written here before cudaGraphLaunch. */
     n_td[std] = n;
 
-    if (!dev_r[std]) {
-      /* First call for this thread: allocate fixed-size device buffers
-         (same as Phase 2) and host mirrors, then CAPTURE the fixed
-         operation sequence into a graph instead of just running it. */
-      cudaMalloc((void**)&dev_r[std],    sizeof(double)*NEMAX*3);
-      cudaMalloc((void**)&dev_ra[std],   sizeof(double)*NMAX*3);
-      cudaMalloc((void**)&dev_head[std], sizeof(int)*NCLMAX);
-      cudaMalloc((void**)&dev_lscl[std], sizeof(int)*NEMAX);
-      cudaMalloc((void**)&dev_pe[std],   sizeof(double)*NCLMAX);
-      cudaMalloc((void**)&dev_n[std],    sizeof(int));
-      ra_host_td[std] = (double*)malloc(sizeof(double)*NMAX*3);
-      pe_host_td[std] = (double*)malloc(sizeof(double)*NCLMAX);
+    /* ***** MODIFIED (GRAPH) ***** (Re)capture only when the current call
+       needs more room than what was captured before -- not on every call,
+       and not sized to the compile-time maxima (NEMAX/NMAX) on every call
+       either. Always copying the full NEMAX/NMAX extent (point 1 in an
+       earlier version of this file) was simplest, but silently taxes every
+       single step with however many x more bytes NEMAX/NMAX are than the
+       system actually in use (e.g. NEMAX=200000 against an actual n+nb in
+       the tens of thousands is a multi-MB copy inflation PER STEP, PER
+       THREAD) -- enough to swamp the very launch-overhead savings this
+       phase exists to demonstrate, especially at the small system sizes
+       the benchmark most wants to show Graphs winning at. Instead, each
+       thread captures sized to its current need plus 25% headroom (so
+       ordinary step-to-step atom migration across MPI-rank boundaries
+       doesn't trigger a recapture), and only rebuilds the graph on the
+       rare occasion that headroom is exceeded. lcxyz2 is additionally
+       known to be exactly constant for the whole run (fixed at
+       init_params(), see that function's comment), so head[]/pe_cell[]
+       are captured at that exact size with no headroom needed at all. */
+    int need_ne = n+nb;
+    int need_nm = n;
+    if (!dev_r[std] || need_ne > cap_ne[std] || need_nm > cap_nm[std] || lcxyz2 != cap_cl[std]) {
+      if (dev_r[std]) {
+        /* Not the first call -- a previous, smaller capture is being
+           outgrown. Tear down the stale graph/stream/buffers first. */
+        cudaGraphExecDestroy(graphExec[std]);
+        cudaStreamDestroy(stream[std]);
+        cudaFree(dev_r[std]);
+        cudaFree(dev_ra[std]);
+        cudaFree(dev_lscl[std]);
+        free(ra_host_td[std]);
+        if (lcxyz2 != cap_cl[std]) { cudaFree(dev_head[std]); cudaFree(dev_pe[std]); free(pe_host_td[std]); }
+      }
 
-      cudaStreamCreate(&stream[std]);
+      cap_ne[std] = need_ne + need_ne/4 + 64; if (cap_ne[std] > NEMAX) cap_ne[std] = NEMAX;
+      cap_nm[std] = need_nm + need_nm/4 + 64; if (cap_nm[std] > NMAX)  cap_nm[std] = NMAX;
+      cap_cl[std] = lcxyz2; /* exact -- constant for the whole run */
+
+      cudaMalloc((void**)&dev_r[std],    sizeof(double)*cap_ne[std]*3);
+      cudaMalloc((void**)&dev_ra[std],   sizeof(double)*cap_nm[std]*3);
+      cudaMalloc((void**)&dev_lscl[std], sizeof(int)*cap_ne[std]);
+      ra_host_td[std] = (double*)malloc(sizeof(double)*cap_nm[std]*3);
+      if (!dev_head[std]) {
+        /* lcxyz2-sized buffers: allocated exactly once, ever. */
+        cudaMalloc((void**)&dev_head[std], sizeof(int)*cap_cl[std]);
+        cudaMalloc((void**)&dev_pe[std],   sizeof(double)*cap_cl[std]);
+        cudaMalloc((void**)&dev_n[std],    sizeof(int));
+        pe_host_td[std] = (double*)malloc(sizeof(double)*cap_cl[std]);
+        cudaStreamCreate(&stream[std]);
+      }
 
       /* dim3 grid is fixed for the whole run: thbk[]/mofst[] never change
          after init_params(), so the captured launch configuration (and
-         every node's addresses/sizes) stays valid on every later replay. */
+         every node's addresses/sizes) stays valid on every later replay,
+         until the next time this block runs. */
       dim3 grid(thbk[0], thbk[1], thbk[2]);
 
       cudaStreamBeginCapture(stream[std], cudaStreamCaptureModeThreadLocal);
-      /* ***** MODIFIED (GRAPH) ***** fixed, compile-time-maximum byte
-         counts on every node -- see file header point 1. */
-      cudaMemcpyAsync(dev_r[std],    r,    sizeof(double)*NEMAX*3, cudaMemcpyHostToDevice, stream[std]);
-      cudaMemcpyAsync(dev_head[std], head, sizeof(int)*NCLMAX,     cudaMemcpyHostToDevice, stream[std]);
-      cudaMemcpyAsync(dev_lscl[std], lscl, sizeof(int)*NEMAX,      cudaMemcpyHostToDevice, stream[std]);
-      cudaMemcpyAsync(dev_n[std],   &n_td[std], sizeof(int),       cudaMemcpyHostToDevice, stream[std]);
-      cudaMemsetAsync(dev_ra[std], 0, sizeof(double)*NMAX*3,  stream[std]);
-      cudaMemsetAsync(dev_pe[std], 0, sizeof(double)*NCLMAX,  stream[std]);
+      cudaMemcpyAsync(dev_r[std],    r,    sizeof(double)*cap_ne[std]*3, cudaMemcpyHostToDevice, stream[std]);
+      cudaMemcpyAsync(dev_head[std], head, sizeof(int)*cap_cl[std],      cudaMemcpyHostToDevice, stream[std]);
+      cudaMemcpyAsync(dev_lscl[std], lscl, sizeof(int)*cap_ne[std],      cudaMemcpyHostToDevice, stream[std]);
+      cudaMemcpyAsync(dev_n[std],   &n_td[std], sizeof(int),             cudaMemcpyHostToDevice, stream[std]);
+      cudaMemsetAsync(dev_ra[std], 0, sizeof(double)*cap_nm[std]*3, stream[std]);
+      cudaMemsetAsync(dev_pe[std], 0, sizeof(double)*cap_cl[std],   stream[std]);
       gpu_compute_accel_kernel<<<grid,1,0,stream[std]>>>(
           dev_r[std], dev_ra[std], dev_head[std], dev_lscl[std], dev_pe[std],
           lcyz2, lc2[2], dev_n[std], RCUT*RCUT, Duc, Uc,
           mofst[0], mofst[1], mofst[2]);
-      cudaMemcpyAsync(ra_host_td[std], dev_ra[std], sizeof(double)*NMAX*3,  cudaMemcpyDeviceToHost, stream[std]);
-      cudaMemcpyAsync(pe_host_td[std], dev_pe[std], sizeof(double)*NCLMAX,  cudaMemcpyDeviceToHost, stream[std]);
+      cudaMemcpyAsync(ra_host_td[std], dev_ra[std], sizeof(double)*cap_nm[std]*3, cudaMemcpyDeviceToHost, stream[std]);
+      cudaMemcpyAsync(pe_host_td[std], dev_pe[std], sizeof(double)*cap_cl[std],   cudaMemcpyDeviceToHost, stream[std]);
 
       cudaGraph_t graph;
       cudaStreamEndCapture(stream[std], &graph);
